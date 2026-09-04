@@ -304,6 +304,22 @@ def _merge_proactive_screen_data(raw: Any) -> dict:
     return result
 
 
+def _default_notice_data() -> dict:
+    return {
+        "enabled": True,
+        "poll_sec": 3,
+        "duration_ms": 15000,
+        "data_dir": "",
+    }
+
+
+def _merge_notice_data(raw: Any) -> dict:
+    result = _default_notice_data()
+    if isinstance(raw, dict):
+        result.update(raw)
+    return result
+
+
 def _merge_agent_link_data(raw: Any) -> dict:
     return _clean_agent_link_data(raw)
 
@@ -583,6 +599,7 @@ class Config:
             "chat_always_on_top": False,  # 聊天窗置顶
             "dynamic_island": _default_dynamic_island_data(),
             "proactive_screen": _default_proactive_screen_data(),
+            "notice": _default_notice_data(),
             "agent_link": _default_agent_link_data(),
             "chat_ui_style": "modern",  # modern / classic（仅聊天窗口保留双实现）
             "chat_follow_pet": False,   # 聊天窗口是否跟随桌宠移动
@@ -731,6 +748,8 @@ class Config:
                 self.data[key] = raw[key]
         if "proactive_screen" in raw:
             self.data["proactive_screen"] = _merge_proactive_screen_data(raw["proactive_screen"])
+        if "notice" in raw:
+            self.data["notice"] = _merge_notice_data(raw["notice"])
         if "agent_link" in raw:
             self.data["agent_link"] = _merge_agent_link_data(raw["agent_link"])
         self._migrate_click_sound_config(raw)

@@ -245,7 +245,15 @@ class PetApp:
         self._sync_dynamic_island()
         self._apply_spawn_offset()
         self._apply_balance_timer()
+        self._start_notice_channel()
         QTimer.singleShot(3500, self._check_autostart_wanted)
+
+    def _start_notice_channel(self) -> None:
+        """专用通知通道（挂单/操作提醒）：轮询 notice.json，id 变化即弹带确认按钮的气泡。"""
+        from .notice import NoticeChannel
+
+        self.notice_channel = NoticeChannel(self.config, lambda: self.win, parent=self)
+        self.notice_channel.start()
 
     def _sync_dynamic_island(self) -> None:
         """按配置创建/隐藏灵动岛；桌宠隐藏后灵动岛仍可常驻。"""
