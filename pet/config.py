@@ -614,6 +614,8 @@ class Config:
             # 也强制为 False：本键只是「用户请求」，平台门禁在启用点收口。
             "decode_broker_enabled": False,
             "system_notifications_enabled": True,  # 对话完成/失败/需要授权时弹桌面系统通知
+            "todo_reminder_enabled": True,   # 待办提醒总开关
+            "todo_reminder_lead_minutes": 5,  # 待办提前提醒分钟数（0~60，0=不提前）
             **DEFAULT_COLLISION_SETTINGS,
             "chat": _default_chat_data(),
         }
@@ -735,6 +737,7 @@ class Config:
             "chat_ui_style",
             "chat_follow_pet",
             "system_notifications_enabled",
+            "todo_reminder_enabled", "todo_reminder_lead_minutes",
             "character_aliases",
             "character_profiles",
             "chat_always_on_top",
@@ -754,6 +757,42 @@ class Config:
             self.data["agent_link"] = _merge_agent_link_data(raw["agent_link"])
         self._migrate_click_sound_config(raw)
         self.data["version"] = 4
+        self._migrate_plaintext_keys_to_keyring()
+
+    def _migrate_plaintext_keys_to_keyring(self) -> None:
+        """加载时把磁盘遗留的明文 API Key 迁移进 keyring。
+
+        v4.0.4/4.0.5 起 _redacted_data() 写盘时剔除 chat.providers 下的明文
+        api_key/vision_api_key，但 SecretStore.set 只在设置对话框保存时调用——
+        老版本（≤v4.0.0）磁盘上的明文 key 从未进过 keyring，升级后首次写盘即被剔除，
+        重启后 resolve_api_key 拿不到任何值，聊天/视觉 401 静默失效。
+        此处补迁移：keyring 已有值不覆盖（与 resolve_api_key 的 keyring 优先序一致），
+        仅丢弃明文；set 失败（keyring 不可用）保留内存明文，维持原兜底行为。
+        幂等：迁移成功后内存/磁盘均无明文，重复 reload 无副作用；不主动 save()，
+        写盘剔除交给下次正常保存。
+        """
+        chat = self.data.get("chat")
+        providers = chat.get("providers") if isinstance(chat, dict) else None
+        if not isinstance(providers, dict):
+            return
+        from .chat.models import SecretStore  # 惰性导入，且只实例化一次
+        store = SecretStore()
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            for key_field, ref_field, default_ref in (
+                ("api_key", "api_key_ref", f"provider/{provider_id}"),
+                ("vision_api_key", "vision_api_key_ref", f"provider/{provider_id}/vision"),
+            ):
+                plaintext = str(provider.get(key_field) or "")
+                if not plaintext.strip():
+                    continue
+                ref = str(provider.get(ref_field) or "").strip()
+                if not ref:
+                    ref = default_ref
+                    provider[ref_field] = ref
+                if store.get(ref) or store.set(ref, plaintext):
+                    provider.pop(key_field, None)
 
     def _migrate_click_sound_config(self, raw: dict) -> None:
         """旧版 click_sound_path 迁移为 click_sound_pack。"""
@@ -880,6 +919,13 @@ class Config:
         self.data["system_notifications_enabled"] = _bool_or_default(
             self.data.get("system_notifications_enabled"), True
         )
+        # 待办提醒：开关同规防字符串布尔误开；提前量钳到 [0, 60] 分钟（0=不提前）。
+        self.data["todo_reminder_enabled"] = _bool_or_default(
+            self.data.get("todo_reminder_enabled"), True
+        )
+        self.data["todo_reminder_lead_minutes"] = int(_float_or_default(
+            self.data.get("todo_reminder_lead_minutes"), 5.0, 0.0, 60.0
+        ))
         self.data["agent_link"] = _clean_agent_link_data(self.data.get("agent_link"))
         self.data.update(_clean_collision_data(self.data))
 
@@ -955,6 +1001,7 @@ class Config:
             "collision_sound_enabled", "collision_sound_volume",
             "slingshot_enabled", "throw_strength", "agent_link",
             "idle_low_fps_enabled", "idle_low_fps_threshold",
+            "todo_reminder_enabled", "todo_reminder_lead_minutes",
             "character_profiles", "chat_always_on_top", "dynamic_island",
         }:
             self._normalize_pet_settings()

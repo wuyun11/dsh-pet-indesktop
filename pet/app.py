@@ -41,6 +41,7 @@ from .fun_image_popup import restore_ojingjing_windows
 from .runtime_cleanup import cleanup_stale_runtime_dirs
 from .collision_ipc import CollisionIpcSession
 from .decode_broker import BrokerFacade
+from .todo_reminder import TodoReminderService
 
 
 class _BackgroundResult(QObject):
@@ -224,6 +225,10 @@ class PetApp:
         self._update_bridge = None
         self._balance_cache_path = config.dir / 'balance_cache.json'  # 跨实例共享余额缓存（按 provider 绑定）
         self.collision_ipc = CollisionIpcSession(config, self)
+        # 待办提醒：GUI 线程定时调度服务；win 引用在 tick 时动态读取，
+        # 角色热切换重建窗口后无需重绑。
+        self.todo_service = TodoReminderService(self)
+        self.todo_panel = None
         # P3 broker：PetApp 持有 BrokerFacade（随 collision_ipc 同生命周期）。
         # bind 在窗口 attach_collision_session 尾部完成（facade 需绑定到窗口实际
         # attach 的会话），此处只创建（含开关位），不提前 bind（避免双重连接）。
@@ -245,6 +250,7 @@ class PetApp:
         self._sync_dynamic_island()
         self._apply_spawn_offset()
         self._apply_balance_timer()
+        self.todo_service.start()
         self._start_notice_channel()
         QTimer.singleShot(3500, self._check_autostart_wanted)
 
@@ -312,6 +318,7 @@ class PetApp:
         except Exception:
             logging.exception("退出时关闭 broker facade 失败")
         self.collision_ipc.stop()
+        self.todo_service.stop()
         # 会话异步写盘（B8）：退出前先把各聊天窗口的当前会话提交保存，
         # 再永久关闭写盘 worker（关掉后迟到的 queued 回调提交会被明确拒绝）。
         try:
@@ -589,6 +596,7 @@ class PetApp:
         win.on_open_modern_settings = self.open_modern_settings
         win.on_spawn_pet = self.spawn_pet
         win.on_restore_fun_windows = restore_ojingjing_windows
+        win.on_open_todo_panel = self.open_todo_panel
         win.on_hidden = self._notify_pet_hidden
 
     def _build_window(self, character_id: str, lib: MovieLibrary | None = None) -> PetWindow:
@@ -909,8 +917,23 @@ class PetApp:
             self.win.refresh_pet_settings()
         self._sync_dynamic_island()
         self._apply_balance_timer()
+        self.todo_service.apply_config()
         self._refresh_chat_windows()
         _mac_set_dock_icon_visible(bool(self.config.get("show_dock_icon", True)))
+
+    def open_todo_panel(self) -> None:
+        """打开待办管理面板（非模态单例；条目增删改即时落盘）。"""
+        from .todo_panel import TodoPanelDialog
+
+        if self.todo_panel is None:
+            dialog = TodoPanelDialog(self, parent=self.win)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.finished.connect(self._todo_panel_finished)
+            self.todo_panel = dialog
+        self._present_dialog(self.todo_panel)
+
+    def _todo_panel_finished(self, _result: int) -> None:
+        self.todo_panel = None
 
     def _notify_pet_hidden(self) -> None:
         """用户主动隐藏桌宠后弹托盘提示，指明恢复入口。"""
@@ -1083,8 +1106,21 @@ def _default_xcb_platform_on_wayland() -> None:
         os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 
+def _configure_linux_fcitx_input_method() -> None:
+    """为 PySide6 冻结版选择与内置 Qt ABI 兼容的 Fcitx 输入法前端。"""
+    # Linux 成品随包携带按 PySide6 Qt ABI 编译的 Fcitx 插件；未指定时默认选中 fcitx 上下文。
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("XMODIFIERS", "").strip() != "@im=fcitx":
+        return
+    if not os.environ.get("QT_IM_MODULE", "").strip():
+        os.environ["QT_IM_MODULE"] = "fcitx"
+
+
 def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
     _default_xcb_platform_on_wayland()
+    # 必须在 QApplication 构造前设置，Qt 才会按随包 Fcitx 插件创建输入法上下文。
+    _configure_linux_fcitx_input_method()
     argv = list(argv if argv is not None else sys.argv)
     preferred_slot = None
 

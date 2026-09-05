@@ -1,4 +1,5 @@
 import os
+import types
 
 import pytest
 from datetime import datetime, timezone
@@ -597,6 +598,28 @@ def test_windows_settings_has_no_orphan_macos_dock_toggle(tmp_path, monkeypatch)
     app.processEvents()
 
 
+# Linux 回归：Windows 专属开关不得在非 Windows 平台创建后游离到设置窗左上角。
+def test_linux_settings_has_no_orphan_windows_cursor_passthrough_toggle(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    import pet.modern_settings_dialog as settings_mod
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.sys, "platform", "linux")
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = settings_mod.ModernSettingsDialog(Config(tmp_path), include_ai=False)
+
+    assert dialog.cursor_hidden_passthrough_check is None
+    assert not any(
+        isinstance(child, settings_mod.ToggleSwitch)
+        for child in dialog.children()
+    ), "所有开关都必须被设置行接管，不能游离在窗口左上角"
+
+    dialog.close()
+    app.processEvents()
+
+
 def test_hide_pet_notifies_and_dock_click_restores(tmp_path, monkeypatch):
     """用户主动隐藏：弹托盘提示 + macOS 点击 Dock 图标恢复桌宠。"""
     import sys
@@ -1018,6 +1041,7 @@ def test_modern_settings_finished_refreshes_even_on_rejected(tmp_path, monkeypat
     owner.config = Config(tmp_path)
     owner._apply_balance_timer = lambda: None
     owner._refresh_chat_windows = lambda: None
+    owner.todo_service = types.SimpleNamespace(apply_config=lambda: None)
     monkeypatch.setattr(app_mod, "_mac_set_dock_icon_visible", lambda *a, **k: None)
     PetApp._modern_settings_finished(owner, 0)  # QDialog.Rejected（X 关闭）
     assert refreshed == [1], "Rejected 关闭也必须刷新桌宠"
