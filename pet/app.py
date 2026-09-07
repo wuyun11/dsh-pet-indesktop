@@ -258,7 +258,7 @@ class PetApp:
         """专用通知通道（挂单/操作提醒）：轮询 notice.json，id 变化即弹带确认按钮的气泡。"""
         from .notice import NoticeChannel
 
-        self.notice_channel = NoticeChannel(self.config, lambda: self.win, parent=self)
+        self.notice_channel = NoticeChannel(self.config, lambda: self.win)
         self.notice_channel.start()
 
     def _sync_dynamic_island(self) -> None:

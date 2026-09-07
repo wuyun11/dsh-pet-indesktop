@@ -8,6 +8,9 @@ __pycache__/
 tmp_appdata/
 tests/_tmp_*/
 
+# 通知通道运行时数据（notice.json 当前通知 / ack / sent 历史，由桌宠与调度任务实时读写）
+data/
+
 # 素材：只提交 assets/characters（角色动画），其他 assets 内容不入库
 assets/*
 !assets/characters/

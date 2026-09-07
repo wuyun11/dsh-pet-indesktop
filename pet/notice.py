@@ -5,12 +5,14 @@
 - 推送：外部脚本写入 notice.json：{"id": <唯一>, "text": "...", "ts": <毫秒>}
 - 展示：轮询到 id 变化 → 宠物旁弹出带「确认收到」按钮的气泡
 - 审计：点确认 → notice-ack.log 追加 {"id", "event":"ack", ...}；
-       超时未确认 → 追加 {"id", "event":"expire", ...}（JSONL 追加）
+        超时未确认 → 追加 {"id", "event":"expire", ...}（JSONL 追加）；
+        展示中被更新 id 顶替 → 旧 id 先按 expire 审计（保证每条已展示通知都有收口）。
 """
 from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +23,14 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLay
 
 LOG = logging.getLogger(__name__)
 
-# 默认推送数据目录：<仓库根>/data/notice（可通过配置 notice.data_dir 覆盖）
-_DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "notice"
+def _default_data_dir() -> Path:
+    """推送数据目录：源码运行用 <仓库根>/data/notice（harness/监控脚本就近读写）；
+    打包(frozen)后 __file__ 落在安装目录，改到用户配置目录，避免写入只读/升级丢失。"""
+    if getattr(sys, "frozen", False):
+        from .config import APP_DIR_NAME, _default_base
+
+        return _default_base() / APP_DIR_NAME / "notice"
+    return Path(__file__).resolve().parent.parent / "data" / "notice"
 
 _BUBBLE_STYLE = """
 #notice-bubble {
@@ -157,9 +165,10 @@ class NoticeChannel(QObject):
     ) -> None:
         super().__init__(parent)
         settings = config.get("notice", {}) if isinstance(config.get("notice", {}), dict) else {}
-        self._enabled = bool(settings.get("enabled", True))
+        raw_enabled = settings.get("enabled", True)
+        self._enabled = raw_enabled if isinstance(raw_enabled, bool) else str(raw_enabled).lower() in ("1", "true", "yes")
         configured_dir = str(settings.get("data_dir") or "")
-        self._data_dir = Path(configured_dir).expanduser() if configured_dir else _DEFAULT_DATA_DIR
+        self._data_dir = Path(configured_dir).expanduser() if configured_dir else _default_data_dir()
         self._file = self._data_dir / "notice.json"
         self._ack_log = self._data_dir / "notice-ack.log"
         poll_sec = max(1, int(settings.get("poll_sec", 3) or 3))
@@ -170,6 +179,11 @@ class NoticeChannel(QObject):
         self._bubble.expired.connect(self._on_expired)
         self._baseline = False
         self._last_id = ""
+        # 当前展示中通知的内容副本：ack/expire/顶替审计都从这里取字段，
+        # 不跨对象读气泡私有成员（气泡字段被下一次 show_notice 覆盖后仍可审计）。
+        self._shown_id = ""
+        self._shown_text = ""
+        self._shown_ts = 0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.setInterval(poll_sec * 1000)
@@ -203,10 +217,17 @@ class NoticeChannel(QObject):
         if notice_id == self._last_id:
             return
         self._last_id = notice_id
+        if self._bubble.isVisible() and self._shown_id:
+            # 新通知顶替旧通知：旧气泡既不 ack 也未超时，先按 expire 收口审计
+            LOG.info("notice 顶替 id=%s", self._shown_id)
+            self._audit(self._shown_id, "expire")
         win = self._window_provider()
         anchor = win.visible_content_rect() if win is not None else None
         LOG.info("notice 触发 id=%s", notice_id)
         self._bubble.show_notice(notice_id, text, int(data.get("ts") or 0), anchor)
+        self._shown_id = notice_id
+        self._shown_text = text
+        self._shown_ts = int(data.get("ts") or 0)
 
     # ------------------------------------------------------------ 审计
     def _on_acked(self, notice_id: str) -> None:
@@ -216,12 +237,14 @@ class NoticeChannel(QObject):
         self._audit(notice_id, "expire")
 
     def _audit(self, notice_id: str, event: str) -> None:
-        """追加 JSONL 审计：ack=用户确认 / expire=未确认过期。"""
+        """追加 JSONL 审计：ack=用户确认 / expire=未确认过期或被新通知顶替。"""
+        if not notice_id:
+            return
         line = {
             "id": notice_id,
             "event": event,
-            "text": self._bubble._notice_text,
-            "ts": self._bubble._notice_ts,
+            "text": self._shown_text,
+            "ts": self._shown_ts,
             "receivedAt": datetime.now().isoformat(timespec="seconds"),
         }
         try:
