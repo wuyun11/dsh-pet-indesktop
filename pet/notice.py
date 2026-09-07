@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """专用通知通道（挂单/操作提醒）。
 
-notice.json 保持兼容 `{id,text,ts}`，日盘助手可额外携带 `detail_url`。
-详情按钮只允许打开配置的本机 8084 决策中心；打开详情不等于 ack、采纳或成交。
+notice.json 保持兼容 `{id,text,ts}`，日盘助手可额外携带 `detail_url`
+和可选的 `duration_ms`（毫秒，合法值小于 15s 会被抬到 15s 下限；
+缺失时用配置 `notice.duration_ms`，同样不低于 15s）。
+气泡展示期间会跟随桌宠移动。详情按钮只允许打开配置的本机 8084
+决策中心；打开详情不等于 ack、采纳或成交。
 """
 from __future__ import annotations
 
@@ -19,6 +22,30 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLay
 
 LOG = logging.getLogger(__name__)
 DEFAULT_DETAIL_BASE_URL = "http://127.0.0.1:8084"
+MIN_NOTICE_DURATION_MS = 15000  # notice 最短展示时长：低于它的传入时长一律抬到默认时长
+
+
+def _clamp_notice_duration(value: object) -> int:
+    """把配置/调用方传入的毫秒时长抬到最小展示时长下限。"""
+    try:
+        ms = int(float(value))
+    except (TypeError, ValueError):
+        return MIN_NOTICE_DURATION_MS
+    return max(MIN_NOTICE_DURATION_MS, ms)
+
+
+def _payload_duration_ms(payload: dict) -> int | None:
+    """读取 notice.json 可选 duration_ms；非法/缺失返回 None（走配置时长）。"""
+    raw = payload.get("duration_ms")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        ms = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    return max(MIN_NOTICE_DURATION_MS, ms)
 
 
 def _default_data_dir() -> Path:
@@ -64,7 +91,7 @@ class NoticeBubble(QFrame):
     acked = Signal(str)
     expired = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None, *, duration_ms: int = 15000):
+    def __init__(self, parent: QWidget | None = None, *, duration_ms: int = MIN_NOTICE_DURATION_MS):
         super().__init__(parent)
         flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
         self.setWindowFlags(flags)
@@ -103,13 +130,13 @@ class NoticeBubble(QFrame):
         self._notice_text = ""
         self._notice_ts = 0
         self._detail_url = ""
-        self._duration_ms = max(1000, int(duration_ms))
+        self._duration_ms = _clamp_notice_duration(duration_ms)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_expire)
         self.hide()
 
-    def show_notice(self, notice_id: str, text: str, ts: int, anchor_rect: QRect | None, *, detail_url: str = "") -> None:
+    def show_notice(self, notice_id: str, text: str, ts: int, anchor_rect: QRect | None, *, detail_url: str = "", duration_ms: int | None = None) -> None:
         self._notice_id = notice_id
         self._notice_text = text
         self._notice_ts = ts
@@ -122,11 +149,17 @@ class NoticeBubble(QFrame):
         self.raise_()
         if self._timer.isActive():
             self._timer.stop()
-        self._timer.start(self._duration_ms)
+        effective = self._duration_ms if duration_ms is None else _clamp_notice_duration(duration_ms)
+        self._timer.start(effective)
 
     def dismiss(self) -> None:
         self._timer.stop()
         self.hide()
+
+    def reposition(self, anchor_rect: QRect | None) -> None:
+        """桌宠移动/拖动后重新贴到角色旁（隐藏时不动）。"""
+        if self.isVisible():
+            self._place(anchor_rect)
 
     def _on_detail(self) -> None:
         if self._detail_url:
@@ -175,11 +208,13 @@ class NoticeChannel(QObject):
         self._file = self._data_dir / "notice.json"
         self._ack_log = self._data_dir / "notice-ack.log"
         poll_sec = max(1, int(settings.get("poll_sec", 3) or 3))
-        duration_ms = max(1000, int(settings.get("duration_ms", 15000) or 15000))
+        duration_ms = _clamp_notice_duration(settings.get("duration_ms", MIN_NOTICE_DURATION_MS))
         self._window_provider = window_provider
         self._bubble = NoticeBubble(duration_ms=duration_ms)
         self._bubble.acked.connect(self._on_acked)
         self._bubble.expired.connect(self._on_expired)
+        self._follow_win = None
+        self._follow_cb = None
         self._baseline = False
         self._last_id = ""
         self._shown_id = ""
@@ -198,6 +233,7 @@ class NoticeChannel(QObject):
 
     def stop(self) -> None:
         self._timer.stop()
+        self._detach_position_listener()
         self._bubble.dismiss()
 
     def _poll(self) -> None:
@@ -227,11 +263,45 @@ class NoticeChannel(QObject):
         if data.get("detail_url") and not detail_url:
             LOG.warning("notice detail_url 被拒绝: %r", data.get("detail_url"))
         LOG.info("notice 触发 id=%s", notice_id)
-        self._bubble.show_notice(notice_id, text, int(data.get("ts") or 0), anchor, detail_url=detail_url)
+        self._bubble.show_notice(
+            notice_id, text, int(data.get("ts") or 0), anchor,
+            detail_url=detail_url, duration_ms=_payload_duration_ms(data),
+        )
+        if win is not None:
+            self._attach_position_listener(win)
         self._shown_id = notice_id
         self._shown_text = text
         self._shown_ts = int(data.get("ts") or 0)
         self._shown_detail_url = detail_url
+
+    def _attach_position_listener(self, win) -> None:
+        """气泡展示后挂上桌宠位置监听：拖动/移动时让气泡贴着角色走。"""
+        adder = getattr(win, "add_position_listener", None)
+        if not callable(adder):
+            return
+        if self._follow_win is win and self._follow_cb is not None:
+            return
+        self._detach_position_listener()
+        self._follow_win = win
+        callback = getattr(self, "_on_pet_position_changed")
+        self._follow_cb = callback
+        adder(callback)
+
+    def _detach_position_listener(self) -> None:
+        win, callback = self._follow_win, self._follow_cb
+        self._follow_win = None
+        self._follow_cb = None
+        if win is None or callback is None:
+            return
+        remover = getattr(win, "remove_position_listener", None)
+        if callable(remover):
+            remover(callback)
+
+    def _on_pet_position_changed(self, pet) -> None:
+        """桌宠位置同步帧：用最新可见内容矩形重定位气泡。"""
+        getter = getattr(pet, "visible_content_rect", None)
+        if callable(getter):
+            self._bubble.reposition(getter())
 
     def _on_acked(self, notice_id: str) -> None:
         self._audit(notice_id, "ack")
