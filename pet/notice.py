@@ -1,79 +1,72 @@
 # -*- coding: utf-8 -*-
 """专用通知通道（挂单/操作提醒）。
 
-契约（与 Electron 版 dsh-pet 一致，stock-watch 推送页/监控脚本零改动复用）：
-- 推送：外部脚本写入 notice.json：{"id": <唯一>, "text": "...", "ts": <毫秒>}
-- 展示：轮询到 id 变化 → 宠物旁弹出带「确认收到」按钮的气泡
-- 审计：点确认 → notice-ack.log 追加 {"id", "event":"ack", ...}；
-        超时未确认 → 追加 {"id", "event":"expire", ...}（JSONL 追加）；
-        展示中被更新 id 顶替 → 旧 id 先按 expire 审计（保证每条已展示通知都有收口）。
+notice.json 保持兼容 `{id,text,ts}`，日盘助手可额外携带 `detail_url`。
+详情按钮只允许打开配置的本机 8084 决策中心；打开详情不等于 ack、采纳或成交。
 """
 from __future__ import annotations
 
 import json
 import logging
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 LOG = logging.getLogger(__name__)
+DEFAULT_DETAIL_BASE_URL = "http://127.0.0.1:8084"
+
 
 def _default_data_dir() -> Path:
-    """推送数据目录：源码运行用 <仓库根>/data/notice（harness/监控脚本就近读写）；
-    打包(frozen)后 __file__ 落在安装目录，改到用户配置目录，避免写入只读/升级丢失。"""
     if getattr(sys, "frozen", False):
         from .config import APP_DIR_NAME, _default_base
-
         return _default_base() / APP_DIR_NAME / "notice"
     return Path(__file__).resolve().parent.parent / "data" / "notice"
 
+
+def _safe_detail_url(raw: object, base_url: str) -> str:
+    """只接受配置的本机工作台 origin 且路径为 /decisions/<id>。"""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    target = urlsplit(value)
+    base = urlsplit(base_url)
+    if target.scheme not in {"http", "https"}:
+        return ""
+    if target.username or target.password:
+        return ""
+    if target.scheme != base.scheme or target.hostname != base.hostname or target.port != base.port:
+        return ""
+    if target.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return ""
+    if not target.path.startswith("/decisions/"):
+        return ""
+    return value
+
+
 _BUBBLE_STYLE = """
-#notice-bubble {
-  background: rgba(255, 255, 255, 0.95);
-  border: 1px solid rgba(32, 49, 112, 0.35);
-  border-radius: 10px;
-}
-#notice-bubble #notice-text {
-  color: #203170;
-  font-size: 13px;
-}
-#notice-bubble #notice-btn {
-  background: #203170;
-  color: #ffffff;
-  border: none;
-  border-radius: 5px;
-  padding: 3px 10px;
-  font-size: 12px;
-}
-#notice-bubble #notice-btn:hover {
-  background: #2f74e0;
-}
+#notice-bubble { background: rgba(255,255,255,0.95); border: 1px solid rgba(32,49,112,0.35); border-radius: 10px; }
+#notice-bubble #notice-text { color: #203170; font-size: 13px; }
+#notice-bubble QPushButton { border: none; border-radius: 5px; padding: 3px 10px; font-size: 12px; }
+#notice-bubble #notice-btn { background: #203170; color: #ffffff; }
+#notice-bubble #notice-detail-btn { background: rgba(32,49,112,0.10); color: #203170; }
+#notice-bubble QPushButton:hover { background: #2f74e0; color: #ffffff; }
 """
 
 
 class NoticeBubble(QFrame):
-    """宠物旁置顶通知气泡：文案 + 「确认收到」按钮；超时未确认自动关闭并触发过期回调。
+    """宠物旁通知气泡：查看详情（可选）+ 确认收到。"""
 
-    独立 Tool 窗口（自带接收鼠标事件，不需要穿透翻转——这正是独立气泡相对
-    透明主窗口内嵌 DOM 的优势）。
-    """
-
-    acked = Signal(str)  # notice id
-    expired = Signal(str)  # notice id
+    acked = Signal(str)
+    expired = Signal(str)
 
     def __init__(self, parent: QWidget | None = None, *, duration_ms: int = 15000):
         super().__init__(parent)
-        flags = (
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus
-        )
+        flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -90,8 +83,15 @@ class NoticeBubble(QFrame):
         self._text.setWordWrap(True)
         self._text.setMaximumWidth(320)
         layout.addWidget(self._text)
+
         row = QHBoxLayout()
         row.addStretch(1)
+        self._detail_button = QPushButton("查看详情", self)
+        self._detail_button.setObjectName("notice-detail-btn")
+        self._detail_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._detail_button.clicked.connect(self._on_detail)
+        self._detail_button.hide()
+        row.addWidget(self._detail_button)
         self._button = QPushButton("确认收到", self)
         self._button.setObjectName("notice-btn")
         self._button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -102,18 +102,20 @@ class NoticeBubble(QFrame):
         self._notice_id = ""
         self._notice_text = ""
         self._notice_ts = 0
+        self._detail_url = ""
         self._duration_ms = max(1000, int(duration_ms))
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_expire)
         self.hide()
 
-    # ------------------------------------------------------------ 对外
-    def show_notice(self, notice_id: str, text: str, ts: int, anchor_rect: QRect | None) -> None:
+    def show_notice(self, notice_id: str, text: str, ts: int, anchor_rect: QRect | None, *, detail_url: str = "") -> None:
         self._notice_id = notice_id
         self._notice_text = text
         self._notice_ts = ts
+        self._detail_url = detail_url
         self._text.setText(text)
+        self._detail_button.setVisible(bool(detail_url))
         self.adjustSize()
         self._place(anchor_rect)
         self.show()
@@ -126,7 +128,10 @@ class NoticeBubble(QFrame):
         self._timer.stop()
         self.hide()
 
-    # ------------------------------------------------------------ 事件
+    def _on_detail(self) -> None:
+        if self._detail_url:
+            QDesktopServices.openUrl(QUrl(self._detail_url))
+
     def _on_ack(self) -> None:
         self._timer.stop()
         self.hide()
@@ -136,7 +141,6 @@ class NoticeBubble(QFrame):
         self.hide()
         self.expired.emit(self._notice_id)
 
-    # ------------------------------------------------------------ 定位
     def _place(self, anchor_rect: QRect | None) -> None:
         screen = QGuiApplication.screenAt(self.cursor().pos()) or QGuiApplication.primaryScreen()
         if screen is None:
@@ -155,20 +159,19 @@ class NoticeBubble(QFrame):
 
 
 class NoticeChannel(QObject):
-    """通知通道：轮询 notice.json，id 变化即弹带确认按钮的气泡；ack/expire 追加审计日志。"""
+    """轮询 notice.json；首个 id 只作基线，新 id 展示并记录 ack/expire。"""
 
-    def __init__(
-        self,
-        config,
-        window_provider,
-        parent: QObject | None = None,
-    ) -> None:
+    def __init__(self, config, window_provider, parent: QObject | None = None) -> None:
         super().__init__(parent)
         settings = config.get("notice", {}) if isinstance(config.get("notice", {}), dict) else {}
         raw_enabled = settings.get("enabled", True)
         self._enabled = raw_enabled if isinstance(raw_enabled, bool) else str(raw_enabled).lower() in ("1", "true", "yes")
         configured_dir = str(settings.get("data_dir") or "")
         self._data_dir = Path(configured_dir).expanduser() if configured_dir else _default_data_dir()
+        self._detail_base_url = str(settings.get("detail_base_url") or DEFAULT_DETAIL_BASE_URL).rstrip("/")
+        base = urlsplit(self._detail_base_url)
+        if base.hostname not in {"127.0.0.1", "localhost", "::1"} or base.port != 8084:
+            raise ValueError("notice.detail_base_url 必须是本机 8084 工作台地址")
         self._file = self._data_dir / "notice.json"
         self._ack_log = self._data_dir / "notice-ack.log"
         poll_sec = max(1, int(settings.get("poll_sec", 3) or 3))
@@ -179,11 +182,10 @@ class NoticeChannel(QObject):
         self._bubble.expired.connect(self._on_expired)
         self._baseline = False
         self._last_id = ""
-        # 当前展示中通知的内容副本：ack/expire/顶替审计都从这里取字段，
-        # 不跨对象读气泡私有成员（气泡字段被下一次 show_notice 覆盖后仍可审计）。
         self._shown_id = ""
         self._shown_text = ""
         self._shown_ts = 0
+        self._shown_detail_url = ""
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.setInterval(poll_sec * 1000)
@@ -198,7 +200,6 @@ class NoticeChannel(QObject):
         self._timer.stop()
         self._bubble.dismiss()
 
-    # ------------------------------------------------------------ 轮询
     def _poll(self) -> None:
         try:
             data = json.loads(self._file.read_text(encoding="utf-8"))
@@ -211,25 +212,27 @@ class NoticeChannel(QObject):
         if not notice_id or not text:
             return
         if not self._baseline:
-            self._baseline = True  # 首次仅记基线：不重放启动前的旧通知
+            self._baseline = True
             self._last_id = notice_id
             return
         if notice_id == self._last_id:
             return
         self._last_id = notice_id
         if self._bubble.isVisible() and self._shown_id:
-            # 新通知顶替旧通知：旧气泡既不 ack 也未超时，先按 expire 收口审计
             LOG.info("notice 顶替 id=%s", self._shown_id)
             self._audit(self._shown_id, "expire")
         win = self._window_provider()
         anchor = win.visible_content_rect() if win is not None else None
+        detail_url = _safe_detail_url(data.get("detail_url"), self._detail_base_url)
+        if data.get("detail_url") and not detail_url:
+            LOG.warning("notice detail_url 被拒绝: %r", data.get("detail_url"))
         LOG.info("notice 触发 id=%s", notice_id)
-        self._bubble.show_notice(notice_id, text, int(data.get("ts") or 0), anchor)
+        self._bubble.show_notice(notice_id, text, int(data.get("ts") or 0), anchor, detail_url=detail_url)
         self._shown_id = notice_id
         self._shown_text = text
         self._shown_ts = int(data.get("ts") or 0)
+        self._shown_detail_url = detail_url
 
-    # ------------------------------------------------------------ 审计
     def _on_acked(self, notice_id: str) -> None:
         self._audit(notice_id, "ack")
 
@@ -237,16 +240,9 @@ class NoticeChannel(QObject):
         self._audit(notice_id, "expire")
 
     def _audit(self, notice_id: str, event: str) -> None:
-        """追加 JSONL 审计：ack=用户确认 / expire=未确认过期或被新通知顶替。"""
         if not notice_id:
             return
-        line = {
-            "id": notice_id,
-            "event": event,
-            "text": self._shown_text,
-            "ts": self._shown_ts,
-            "receivedAt": datetime.now().isoformat(timespec="seconds"),
-        }
+        line = {"id": notice_id, "event": event, "text": self._shown_text, "ts": self._shown_ts, "detail_url": self._shown_detail_url or None, "receivedAt": datetime.now().isoformat(timespec="seconds")}
         try:
             self._data_dir.mkdir(parents=True, exist_ok=True)
             with open(self._ack_log, "a", encoding="utf-8") as handle:
