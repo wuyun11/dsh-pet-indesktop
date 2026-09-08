@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from PySide6.QtCore import QPoint, QRect
@@ -53,8 +57,8 @@ def _read_audit(data_dir) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _make_channel(tmp_path, *, enabled=True, duration_ms=15000, window=None):
-    return NoticeChannel(_StubConfig({"notice": {"enabled": enabled, "poll_sec": 3, "duration_ms": duration_ms, "data_dir": str(tmp_path), "detail_base_url": "http://127.0.0.1:8084"}}), lambda: window if window is not None else _FakeWindow())
+def _make_channel(tmp_path, *, enabled=True, duration_ms=15000, window=None, ack_callback_base=""):
+    return NoticeChannel(_StubConfig({"notice": {"enabled": enabled, "poll_sec": 3, "duration_ms": duration_ms, "data_dir": str(tmp_path), "detail_base_url": "http://127.0.0.1:8084", "ack_callback_base": ack_callback_base}}), lambda: window if window is not None else _FakeWindow())
 
 
 def _show_second_notice(channel, tmp_path, payload: dict) -> None:
@@ -197,3 +201,105 @@ def test_no_file_or_bad_json_is_silent(tmp_path, app):
     channel = _make_channel(tmp_path); channel._poll(); assert channel._baseline is False
     (tmp_path / "notice.json").write_text("{broken", encoding="utf-8"); channel._poll(); assert channel._baseline is False
     channel.stop()
+
+
+def test_push_http_shows_and_dedups_by_id(tmp_path, app):
+    channel = _make_channel(tmp_path)
+    channel.push_http("h1", "第一条")
+    assert channel._bubble.isVisible()
+    assert channel._bubble._notice_id == "h1"
+    channel.push_http("h1", "第一条")
+    assert channel._bubble._notice_id == "h1"
+    assert _read_audit(tmp_path) == []
+    channel.push_http("h2", "第二条")
+    assert channel._bubble._notice_id == "h2"
+    lines = _read_audit(tmp_path)
+    assert lines[0]["id"] == "h1" and lines[0]["event"] == "expire"
+    channel.stop()
+
+
+def test_push_http_ignored_when_disabled(tmp_path, app):
+    channel = _make_channel(tmp_path, enabled=False)
+    channel.push_http("h1", "x")
+    assert not channel._bubble.isVisible()
+    channel.stop()
+
+
+def test_push_http_ignores_empty_fields(tmp_path, app):
+    channel = _make_channel(tmp_path)
+    channel.push_http("", "x")
+    channel.push_http("h1", "   ")
+    assert not channel._bubble.isVisible()
+    channel.stop()
+
+
+def test_ack_fires_http_callback_with_id(tmp_path, app):
+    fired = threading.Event()
+    calls = []
+    channel = _make_channel(tmp_path, ack_callback_base="http://127.0.0.1:4091")
+
+    def recorder(url: str) -> None:
+        calls.append(url)
+        fired.set()
+
+    channel._post_ack = recorder
+    _show_second_notice(channel, tmp_path, {"id": "n2", "text": "新", "ts": 2})
+    _click_ack(channel)
+    assert fired.wait(2.0)
+    assert calls == ["http://127.0.0.1:4091/notify/n2/ack"]
+    lines = _read_audit(tmp_path)
+    assert lines[0]["event"] == "ack" and lines[0]["id"] == "n2"
+    channel.stop()
+
+
+def test_ack_without_callback_base_only_audits(tmp_path, app):
+    channel = _make_channel(tmp_path)
+    _show_second_notice(channel, tmp_path, {"id": "n2", "text": "新", "ts": 2})
+    _click_ack(channel)
+    lines = _read_audit(tmp_path)
+    assert lines[0]["event"] == "ack" and lines[0]["id"] == "n2"
+    channel.stop()
+
+
+def test_ack_callback_failure_keeps_local_audit(tmp_path, app):
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+    channel = _make_channel(tmp_path, ack_callback_base=f"http://127.0.0.1:{closed_port}")
+    _show_second_notice(channel, tmp_path, {"id": "n2", "text": "新", "ts": 2})
+    _click_ack(channel)
+    lines = _read_audit(tmp_path)
+    assert lines[0]["event"] == "ack" and lines[0]["id"] == "n2"
+    time.sleep(0.2)  # 后台回调线程失败只记日志，不影响本地审计
+    channel.stop()
+
+
+def test_ack_callback_reaches_backend_with_post(tmp_path, app):
+    captured = {}
+    received = threading.Event()
+
+    class _Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            captured["path"] = self.path
+            self.send_response(200)
+            self.end_headers()
+            received.set()
+
+        def log_message(self, *args):
+            pass
+
+    receiver = ThreadingHTTPServer(("127.0.0.1", 0), _Receiver)
+    receiver.daemon_threads = True
+    threading.Thread(target=receiver.serve_forever, daemon=True).start()
+    try:
+        port = receiver.server_address[1]
+        channel = _make_channel(tmp_path, ack_callback_base=f"http://127.0.0.1:{port}")
+        _show_second_notice(channel, tmp_path, {"id": "n2", "text": "新", "ts": 2})
+        _click_ack(channel)
+        assert received.wait(3.0)
+        assert captured["path"] == "/notify/n2/ack"
+        channel.stop()
+    finally:
+        receiver.shutdown()
+        receiver.server_close()

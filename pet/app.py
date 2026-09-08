@@ -260,6 +260,28 @@ class PetApp:
 
         self.notice_channel = NoticeChannel(self.config, lambda: self.win)
         self.notice_channel.start()
+        self._start_notice_api()
+
+    def _start_notice_api(self) -> None:
+        """本机 HTTP 接口：POST /api/notice 接收 {id, text}，复用 notice 展示逻辑。"""
+        from .notice_api import NoticeDispatcher, NoticeHttpServer, validate_api_host
+
+        settings = self.config.get("notice", {}) or {}
+        if not isinstance(settings, dict):
+            settings = {}
+        api_host = str(settings.get("api_host") or "127.0.0.1").strip()
+        validate_api_host(api_host)
+        try:
+            api_port = int(settings.get("api_port") or 8090)
+        except (TypeError, ValueError):
+            raise ValueError("notice.api_port 必须是 1~65535 的整数")  # noqa: B904
+        if api_port < 1 or api_port > 65535:
+            raise ValueError("notice.api_port 必须是 1~65535 的整数")
+        dispatcher = NoticeDispatcher(enabled=self.notice_channel.is_enabled)
+        dispatcher.notice_received.connect(self.notice_channel.push_http)
+        self.notice_http = NoticeHttpServer(api_host, api_port, dispatcher)
+        self.notice_http.start()
+        logging.info("notice API 已监听 %s:%s", self.notice_http.host, self.notice_http.port)
 
     def _sync_dynamic_island(self) -> None:
         """按配置创建/隐藏灵动岛；桌宠隐藏后灵动岛仍可常驻。"""
@@ -319,6 +341,17 @@ class PetApp:
             logging.exception("退出时关闭 broker facade 失败")
         self.collision_ipc.stop()
         self.todo_service.stop()
+        # 停掉 notice 轮询与本机 HTTP 接口（先关监听，再停轮询）
+        try:
+            if getattr(self, "notice_http", None) is not None:
+                self.notice_http.stop()
+        except Exception:
+            logging.exception("退出时关闭 notice HTTP 服务失败")
+        try:
+            if getattr(self, "notice_channel", None) is not None:
+                self.notice_channel.stop()
+        except Exception:
+            logging.exception("退出时停止 notice 通道失败")
         # 会话异步写盘（B8）：退出前先把各聊天窗口的当前会话提交保存，
         # 再永久关闭写盘 worker（关掉后迟到的 queued 回调提交会被明确拒绝）。
         try:
@@ -1117,6 +1150,28 @@ def _configure_linux_fcitx_input_method() -> None:
         os.environ["QT_IM_MODULE"] = "fcitx"
 
 
+def _parse_api_args(argv: list[str]) -> tuple[str | None, int | None]:
+    """解析 --api-host / --api-port（本机 notice API 监听参数，覆盖配置默认值）。"""
+    api_host = None
+    api_port = None
+    if "--api-host" in argv:
+        index = argv.index("--api-host")
+        if index + 1 >= len(argv) or not str(argv[index + 1]).strip():
+            raise ValueError("缺少 --api-host 参数值")
+        api_host = str(argv[index + 1]).strip()
+    if "--api-port" in argv:
+        index = argv.index("--api-port")
+        if index + 1 >= len(argv):
+            raise ValueError("缺少 --api-port 参数值")
+        try:
+            api_port = int(argv[index + 1])
+        except ValueError:
+            raise ValueError(f"无效的 --api-port 参数: {argv[index + 1]}")  # noqa: B904
+        if api_port < 1 or api_port > 65535:
+            raise ValueError(f"无效的 --api-port 参数 (必须在 1~65535 范围内): {argv[index + 1]}")
+    return api_host, api_port
+
+
 def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
     _default_xcb_platform_on_wayland()
     # 必须在 QApplication 构造前设置，Qt 才会按随包 Fcitx 插件创建输入法上下文。
@@ -1170,6 +1225,18 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
             slot_manager_mod.migrate_legacy_spawns(config_dir)
 
         config = Config(instance_id=instance_id)
+        try:
+            api_host, api_port = _parse_api_args(argv)
+        except ValueError as exc:
+            logging.error("%s", exc)
+            return 1
+        if api_host is not None or api_port is not None:
+            notice = dict(config.get("notice", {}) or {})
+            if api_host is not None:
+                notice["api_host"] = api_host
+            if api_port is not None:
+                notice["api_port"] = api_port
+            config.data["notice"] = notice
         _mac_set_dock_icon_visible(bool(config.get("show_dock_icon", True)))
         _setup_logging(config)
         logging.info("dsh-pet-standalone 启动 (slot: %s, instance: %s)", slot_id, instance_id)

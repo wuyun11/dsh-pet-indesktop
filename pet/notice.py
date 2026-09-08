@@ -12,6 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
+import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -73,6 +76,22 @@ def _safe_detail_url(raw: object, base_url: str) -> str:
     if not target.path.startswith("/decisions/"):
         return ""
     return value
+
+
+def _post_ack_callback(url: str) -> None:
+    """尽力一次的 ack 回调：用户点「确认收到」后通知后端；失败只记日志，不做重试队列。"""
+    try:
+        request = urllib.request.Request(
+            url,
+            data=b"",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            response.read()
+        LOG.info("notice ack 回调成功: %s", url)
+    except Exception:  # noqa: BLE001 - 回调失败不影响本地审计
+        LOG.warning("notice ack 回调失败: %s", url, exc_info=True)
 
 
 _BUBBLE_STYLE = """
@@ -207,6 +226,11 @@ class NoticeChannel(QObject):
             raise ValueError("notice.detail_base_url 必须是本机 8084 工作台地址")
         self._file = self._data_dir / "notice.json"
         self._ack_log = self._data_dir / "notice-ack.log"
+        self._ack_callback_base = str(settings.get("ack_callback_base") or "").strip().rstrip("/")
+        if self._ack_callback_base:
+            base = urlsplit(self._ack_callback_base)
+            if base.scheme not in {"http", "https"} or not base.netloc:
+                raise ValueError("notice.ack_callback_base 必须是合法的 http(s) 地址")
         poll_sec = max(1, int(settings.get("poll_sec", 3) or 3))
         duration_ms = _clamp_notice_duration(settings.get("duration_ms", MIN_NOTICE_DURATION_MS))
         self._window_provider = window_provider
@@ -217,6 +241,8 @@ class NoticeChannel(QObject):
         self._follow_cb = None
         self._baseline = False
         self._last_id = ""
+        self._http_last_id = ""
+        self._post_ack = _post_ack_callback
         self._shown_id = ""
         self._shown_text = ""
         self._shown_ts = 0
@@ -254,25 +280,46 @@ class NoticeChannel(QObject):
         if notice_id == self._last_id:
             return
         self._last_id = notice_id
+        detail_url = _safe_detail_url(data.get("detail_url"), self._detail_base_url)
+        if data.get("detail_url") and not detail_url:
+            LOG.warning("notice detail_url 被拒绝: %r", data.get("detail_url"))
+        self._display_notice(
+            notice_id, text, int(data.get("ts") or 0),
+            detail_url=detail_url, duration_ms=_payload_duration_ms(data),
+        )
+
+    def _display_notice(self, notice_id: str, text: str, ts: int, *, detail_url: str = "", duration_ms: int | None = None) -> None:
+        """共享展示路径：顶替旧气泡并审计 expire，再展示新气泡（文件轮询与 HTTP 共用）。"""
         if self._bubble.isVisible() and self._shown_id:
             LOG.info("notice 顶替 id=%s", self._shown_id)
             self._audit(self._shown_id, "expire")
         win = self._window_provider()
         anchor = win.visible_content_rect() if win is not None else None
-        detail_url = _safe_detail_url(data.get("detail_url"), self._detail_base_url)
-        if data.get("detail_url") and not detail_url:
-            LOG.warning("notice detail_url 被拒绝: %r", data.get("detail_url"))
         LOG.info("notice 触发 id=%s", notice_id)
         self._bubble.show_notice(
-            notice_id, text, int(data.get("ts") or 0), anchor,
-            detail_url=detail_url, duration_ms=_payload_duration_ms(data),
+            notice_id, text, ts, anchor,
+            detail_url=detail_url, duration_ms=duration_ms,
         )
         if win is not None:
             self._attach_position_listener(win)
         self._shown_id = notice_id
         self._shown_text = text
-        self._shown_ts = int(data.get("ts") or 0)
+        self._shown_ts = ts
         self._shown_detail_url = detail_url
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def push_http(self, notice_id: str, text: str) -> None:
+        """HTTP 通道：收 {id, text}，按 id 增量逻辑展示（同 id 不重复弹）。"""
+        notice_id = str(notice_id or "").strip()
+        text = str(text or "").strip()
+        if not self._enabled or not notice_id or not text:
+            return
+        if notice_id == self._http_last_id:
+            return
+        self._http_last_id = notice_id
+        self._display_notice(notice_id, text, int(time.time()))
 
     def _attach_position_listener(self, win) -> None:
         """气泡展示后挂上桌宠位置监听：拖动/移动时让气泡贴着角色走。"""
@@ -305,9 +352,17 @@ class NoticeChannel(QObject):
 
     def _on_acked(self, notice_id: str) -> None:
         self._audit(notice_id, "ack")
+        self._fire_ack_callback(notice_id)
 
     def _on_expired(self, notice_id: str) -> None:
         self._audit(notice_id, "expire")
+
+    def _fire_ack_callback(self, notice_id: str) -> None:
+        """在本地审计之外，尽力通知后端一次；失败只记日志，不重试、不影响审计。"""
+        if not notice_id or not self._ack_callback_base:
+            return
+        url = f"{self._ack_callback_base}/notify/{notice_id}/ack"
+        threading.Thread(target=self._post_ack, args=(url,), daemon=True, name="notice-ack-callback").start()
 
     def _audit(self, notice_id: str, event: str) -> None:
         if not notice_id:

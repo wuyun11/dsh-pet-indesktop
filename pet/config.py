@@ -310,6 +310,9 @@ def _default_notice_data() -> dict:
         "poll_sec": 3,
         "duration_ms": 15000,
         "data_dir": "",
+        "api_host": "127.0.0.1",
+        "api_port": 8090,
+        "ack_callback_base": "http://127.0.0.1:4091",
     }
 
 
