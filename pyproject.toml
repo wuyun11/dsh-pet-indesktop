@@ -27,13 +27,8 @@ select = ["F"]
 # 全部归入结构优化 A17「测试债」批次，基线期整目录豁免，清理时按文件收紧。
 "tests/*.py" = ["F401", "F841"]
 
-# tests 目录 F811（文件内重复定义）：
-#   - test_collision_window.py:780 与 :560 同名测试函数重复定义（后者覆盖前者，
-#     pytest 实际只收集到一份）——批 6-8a 已删除重复定义并解除本豁免。
-#   - test_pet_interaction_locks.py:329、test_proactive.py:613/882/1069：
-#     函数内重复 import 同名模块/符号，属测试代码冗余。
-"tests/test_pet_interaction_locks.py" = ["F811"]
-"tests/test_proactive.py" = ["F811"]
+# tests 目录 F811（文件内重复定义）：相关 GUI 测试已随“会弹窗测试清理”删除，
+# 对应豁免随文件一并移除。
 
 # tests/test_collision_ipc.py：`f"pid123-"` 无占位符，冗余 f 前缀，无害。
 "tests/test_collision_ipc.py" = ["F541"]

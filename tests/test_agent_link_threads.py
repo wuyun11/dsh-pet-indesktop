@@ -338,23 +338,6 @@ class TestDestroyedFallback:
         assert not ref(), "wrapper 未被回收（引用环未断）"
 
 
-class TestCloseEventStopsMonitors:
-    def test_window_close_stops_agent_monitors(self, tmp_path, app):
-        """窗口 closeEvent 会停掉全部 Agent 监视器 worker。"""
-        from tests.test_collision_window import _make_pet_window
-
-        win, _ = _make_pet_window(tmp_path, "b9-close")
-        mgr = win.agent_link_manager
-        mon = mgr.monitors["dsh"]
-        mon._POLL_INTERVAL_S = 0.05
-        mon.start()
-        assert mon._worker.is_alive()
-        win.close()
-        app.processEvents()
-        assert not mon._running
-        assert not mon._worker.is_alive()
-
-
 def _make_opencode_db(path, rows):
     import sqlite3
     if path.exists():

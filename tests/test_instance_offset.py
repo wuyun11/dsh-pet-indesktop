@@ -6,12 +6,94 @@ import json
 import os
 
 import pytest
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication
 
+from pet import catalog
 from pet.config import Config
 from pet.window import PetWindow
 
-from test_window_pause import FakeLibrary
+
+NAMES = [
+    catalog.IDLE,
+    catalog.TURN,
+    catalog.MOVES[0],
+    catalog.CLICKS[0],
+    catalog.DRAG,
+    "写代码",
+]
+
+
+class FakeClip(QObject):
+    """与 WebMClip 接口兼容的极简假播放器，只记录启停状态。"""
+
+    frameChanged = Signal(int)
+    finished = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = False
+        self.stop_count = 0
+        self.start_count = 0
+        self.speed = 1.0
+        self._pm = QPixmap(2, 2)
+        self._pm.fill()
+
+    def stop(self):
+        self._running = False
+        self.stop_count += 1
+
+    def start(self):
+        self._running = True
+        self.start_count += 1
+
+    def jumpToFrame(self, frame_index):
+        return frame_index <= 0
+
+    def set_playback_speed(self, speed):
+        self.speed = speed
+
+    def currentPixmap(self):
+        return self._pm
+
+    def currentFrameNumber(self):
+        return 0
+
+    def frameCount(self):
+        return 1
+
+    def duration(self):
+        return 1.0
+
+    def currentTimeSeconds(self):
+        return 0.0
+
+
+class FakeLibrary:
+    """只包含核心动画名的假素材库，避免测试拉真 ffmpeg。"""
+
+    def __init__(self):
+        self._clips = {name: FakeClip() for name in NAMES}
+        self.manifest = {}
+        self.folder_map = {}
+        self.folder_files = None
+        self.no_mirror = set()
+
+    def names(self):
+        return list(NAMES)
+
+    def movies(self):
+        return dict(self._clips)
+
+    def movie(self, name):
+        return self._clips[name]
+
+    def frames(self, name):
+        return 1
+
+    def duration(self, name):
+        return 1.0
 
 
 @pytest.fixture
