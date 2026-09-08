@@ -307,7 +307,6 @@ def _merge_proactive_screen_data(raw: Any) -> dict:
 def _default_notice_data() -> dict:
     return {
         "enabled": True,
-        "poll_sec": 3,
         "duration_ms": 15000,
         "data_dir": "",
         "api_host": "127.0.0.1",

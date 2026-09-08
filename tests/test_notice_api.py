@@ -34,8 +34,8 @@ class _FakeWindow:
 
 
 def _make_channel(tmp_path, *, enabled=True):
-    cfg = {"notice": {"enabled": enabled, "poll_sec": 3, "duration_ms": 15000,
-                      "data_dir": str(tmp_path), "detail_base_url": "http://127.0.0.1:8084"}}
+    cfg = {"notice": {"enabled": enabled, "duration_ms": 15000,
+                      "data_dir": str(tmp_path), "ack_callback_base": ""}}
     return NoticeChannel(_StubConfig(cfg), lambda: _FakeWindow())
 
 

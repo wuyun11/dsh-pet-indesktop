@@ -255,11 +255,10 @@ class PetApp:
         QTimer.singleShot(3500, self._check_autostart_wanted)
 
     def _start_notice_channel(self) -> None:
-        """专用通知通道（挂单/操作提醒）：轮询 notice.json，id 变化即弹带确认按钮的气泡。"""
+        """专用通知通道（挂单/操作提醒）：HTTP 收 {id, text}，id 变化即弹带确认按钮的气泡。"""
         from .notice import NoticeChannel
 
         self.notice_channel = NoticeChannel(self.config, lambda: self.win)
-        self.notice_channel.start()
         self._start_notice_api()
 
     def _start_notice_api(self) -> None:
